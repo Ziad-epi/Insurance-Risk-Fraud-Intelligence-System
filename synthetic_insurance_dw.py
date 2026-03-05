@@ -2,6 +2,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
 from scipy import stats
 import statsmodels.api as sm
 from sklearn.model_selection import train_test_split
@@ -957,7 +958,9 @@ def train_poisson_glm(X_train: pd.DataFrame, y_train: pd.Series, offset_train: p
     return result
 
 
-def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, offset_test: pd.Series) -> None:
+def evaluate_frequency_model(
+    model, X_test: pd.DataFrame, y_test: pd.Series, offset_test: pd.Series
+) -> None:
     """Evaluate predictive performance and dispersion."""
     # Predict expected claim counts
     y_pred = model.predict(X_test, offset=offset_test)
@@ -984,7 +987,7 @@ def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, offset_test: 
         print("- Dispersion close to Poisson; Poisson GLM is reasonable.")
 
 
-def interpret_coefficients(model) -> None:
+def interpret_frequency_coefficients(model) -> None:
     """Interpret top drivers using multiplicative effects."""
     params = model.params.copy()
     coef_table = pd.DataFrame(
@@ -1004,12 +1007,239 @@ def interpret_coefficients(model) -> None:
     # exp(coef) > 1 increases expected frequency; exp(coef) < 1 decreases it.
 
 
-def main(policy_master: pd.DataFrame):
+def frequency_main(policy_master: pd.DataFrame):
     X_train, X_test, y_train, y_test, offset_train, offset_test = prepare_frequency_data(
         policy_master
     )
     model = train_poisson_glm(X_train, y_train, offset_train)
-    evaluate_model(model, X_test, y_test, offset_test)
+    evaluate_frequency_model(model, X_test, y_test, offset_test)
+    interpret_frequency_coefficients(model)
+    return model
+
+
+def prepare_severity_data(claim_master: pd.DataFrame):
+    """Prepare design matrix for Gamma severity modeling."""
+    df = claim_master.copy()
+
+    # Identify critical columns (robust to naming variants)
+    amount_col = _first_existing(
+        df,
+        ["claim_amount", "claim_cost", "loss_amount", "paid_amount", "incurred_amount"],
+        "claim_amount",
+    )
+    age_col = _first_existing(df, ["age", "driver_age", "policyholder_age"], "age")
+    vehicle_age_col = _first_existing(
+        df, ["vehicle_age", "car_age", "vehicle_years"], "vehicle_age"
+    )
+    vehicle_power_col = _first_existing(
+        df, ["vehicle_power", "engine_power", "horsepower"], "vehicle_power"
+    )
+    bonus_malus_col = _first_existing(
+        df, ["bonus_malus", "bonus_malus_factor", "bonus_malus_score"], "bonus_malus"
+    )
+    delay_col = _first_existing(
+        df,
+        ["delay", "report_delay", "claim_report_delay_days", "days_to_report"],
+        "delay",
+    )
+    region_col = _first_existing(
+        df, ["region", "territory", "geo_region", "claim_region"], "region"
+    )
+    vehicle_type_col = _first_existing(
+        df, ["vehicle_type", "vehicle_class", "vehicle_segment"], "vehicle_type"
+    )
+    inflation_col = _first_existing(
+        df, ["inflation_index", "inflation", "cpi", "inflation_rate"], "inflation_index"
+    )
+    premium_col = _first_existing(
+        df,
+        ["annual_premium", "earned_premium", "premium", "written_premium", "net_premium"],
+        "premium",
+    )
+
+    # Remove invalid observations (actuarial: severity must be positive)
+    df = df[df[amount_col] > 0].copy()
+
+    # Prefer pre-claim estimates to avoid leakage; fallback uses final amount with warning
+    preclaim_candidates = [
+        "reported_claim_amount",
+        "initial_claim_amount",
+        "claim_estimate",
+        "estimated_claim_amount",
+        "reported_amount",
+        "initial_reported_amount",
+    ]
+    preclaim_col = ""
+    for col in preclaim_candidates:
+        if col in df.columns:
+            preclaim_col = col
+            break
+    if preclaim_col:
+        amount_basis = df[preclaim_col].astype(float)
+    else:
+        amount_basis = df[amount_col].astype(float)
+        warnings.warn(
+            "No pre-claim estimate column found. claim_to_premium_ratio and "
+            "large_and_fast_flag will use final claim_amount, which can leak target information."
+        )
+
+    # Engineered features (behavioral severity signals)
+    df["claim_to_premium_ratio"] = amount_basis / df[premium_col].replace(0, np.nan)
+    df["suspicious_delay_flag"] = (df[delay_col] > 15).astype(int)
+    df["large_and_fast_flag"] = ((amount_basis > 4000) & (df[delay_col] <= 3)).astype(int)
+
+    # Clean engineered feature infinities
+    df["claim_to_premium_ratio"] = df["claim_to_premium_ratio"].replace([np.inf, -np.inf], np.nan)
+
+    # Drop rows with missing critical variables
+    critical_cols = [
+        amount_col,
+        age_col,
+        vehicle_age_col,
+        vehicle_power_col,
+        bonus_malus_col,
+        delay_col,
+        region_col,
+        vehicle_type_col,
+        inflation_col,
+        premium_col,
+        "claim_to_premium_ratio",
+        "suspicious_delay_flag",
+        "large_and_fast_flag",
+    ]
+    df = df.dropna(subset=critical_cols).copy()
+
+    # Target
+    y = df[amount_col].astype(float)
+
+    # Numeric features
+    X_num = df[
+        [
+            age_col,
+            vehicle_age_col,
+            vehicle_power_col,
+            bonus_malus_col,
+            delay_col,
+            inflation_col,
+            "claim_to_premium_ratio",
+            "suspicious_delay_flag",
+            "large_and_fast_flag",
+        ]
+    ].copy()
+
+    # Categorical encoding (region and vehicle type)
+    X_cat = pd.get_dummies(df[[region_col, vehicle_type_col]], drop_first=True)
+
+    # Combine and add constant
+    X = pd.concat([X_num, X_cat], axis=1)
+    X = sm.add_constant(X, has_constant="add")
+
+    # Train-test split (no leakage from target)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    return X_train, X_test, y_train, y_test
+
+
+def train_gamma_glm(X_train: pd.DataFrame, y_train: pd.Series):
+    """Fit Gamma GLM with log link for claim severity."""
+    # Actuarial: Gamma for positive, right-skewed severities
+    # Log link keeps predictions strictly positive
+    model = sm.GLM(
+        y_train,
+        X_train,
+        family=sm.families.Gamma(link=sm.families.links.log()),
+    )
+    result = model.fit()
+    print(result.summary())
+    return result
+
+
+def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series) -> None:
+    """Evaluate model accuracy on holdout data."""
+    y_pred = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = mean_squared_error(y_test, y_pred, squared=False)
+    mape = np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 1e-6))) * 100
+
+    predicted_mean = np.mean(y_pred)
+    actual_mean = np.mean(y_test)
+
+    print("\n=== Severity Model Evaluation ===")
+    print(f"MAE: {mae:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    print(f"Predicted mean: {predicted_mean:.2f}")
+    print(f"Actual mean: {actual_mean:.2f}")
+
+
+def residual_analysis(model, X_test: pd.DataFrame, y_test: pd.Series) -> None:
+    """Residual diagnostics for heavy-tail behavior."""
+    y_pred = model.predict(X_test)
+    residuals = y_test - y_pred
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(residuals, bins=30, color="#4E79A7", alpha=0.8)
+    plt.title("Residual Histogram")
+    plt.xlabel("Residual")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    plt.scatter(y_pred, residuals, alpha=0.4, color="#E15759")
+    plt.axhline(0, color="black", linestyle="--", linewidth=1)
+    plt.title("Residuals vs Predicted")
+    plt.xlabel("Predicted Severity")
+    plt.ylabel("Residual")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(6, 6))
+    stats.probplot(residuals, dist="norm", plot=plt)
+    plt.title("Q-Q Plot of Residuals")
+    plt.tight_layout()
+    plt.show()
+
+    skew_val = stats.skew(residuals)
+    kurt_val = stats.kurtosis(residuals, fisher=False)
+    print(f"Residual skewness: {skew_val:.2f}")
+    print(f"Residual kurtosis: {kurt_val:.2f}")
+
+    # Actuarial interpretation of tail risk
+    if kurt_val > 5:
+        print("Heavy-tail behavior remains; large loss risk persists in residuals.")
+    else:
+        print("Residual tail behavior is moderate; Gamma fit is reasonable.")
+
+
+def interpret_coefficients(model) -> None:
+    """Interpret multiplicative effects of severity drivers."""
+    params = model.params.copy()
+    coef_table = pd.DataFrame(
+        {
+            "feature": params.index,
+            "coef": params.values,
+            "exp_coef": np.exp(params.values),
+            "abs_coef": np.abs(params.values),
+        }
+    )
+    coef_table = coef_table.sort_values("abs_coef", ascending=False)
+
+    print("\n=== Top 10 Severity Drivers ===")
+    print(coef_table[["feature", "coef", "exp_coef"]].head(10).to_string(index=False))
+
+    # Actuarial: exp(coef) = multiplicative effect on expected claim severity
+    # Example: exp(coef)=1.20 implies ~20% higher expected claim cost.
+
+
+def main(claim_master: pd.DataFrame):
+    X_train, X_test, y_train, y_test = prepare_severity_data(claim_master)
+    model = train_gamma_glm(X_train, y_train)
+    evaluate_model(model, X_test, y_test)
+    residual_analysis(model, X_test, y_test)
     interpret_coefficients(model)
     return model
 
