@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
 
 
@@ -207,7 +209,194 @@ def print_summary(policy_master, claim_master):
         print(policy_master["loss_ratio"].describe())
 
 
-def main(base_dir: str = "Dataset"):
+def compute_expected_losses(policy_master: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute expected losses at the policy level for pricing impact analysis.
+    """
+    df = policy_master.copy()
+
+    # Business logic: expected loss is the actuarial expected cost of claims.
+    df["expected_loss"] = df["expected_claim_frequency"] * df["expected_claim_severity"]
+
+    portfolio_expected_loss = df["expected_loss"].sum()
+    portfolio_premium = df["annual_premium"].sum()
+
+    print("\n=== Expected Losses ===")
+    print(f"Portfolio expected loss: {portfolio_expected_loss:,.2f}")
+    print(f"Portfolio premium: {portfolio_premium:,.2f}")
+
+    return df
+
+
+def loss_comparison(policy_master: pd.DataFrame) -> None:
+    """
+    Compare actual vs predicted losses to validate pricing adequacy.
+    """
+    df = policy_master.copy()
+
+    actual_loss = df["total_claim_amount_per_policy"].astype(float)
+    expected_loss = df["expected_loss"].astype(float)
+
+    # Financial metrics for model validation.
+    mae = np.mean(np.abs(actual_loss - expected_loss))
+    rmse = np.sqrt(np.mean((actual_loss - expected_loss) ** 2))
+    corr = np.corrcoef(actual_loss, expected_loss)[0, 1]
+
+    print("\n=== Loss Comparison ===")
+    print(f"MAE: {mae:,.2f}")
+    print(f"RMSE: {rmse:,.2f}")
+    print(f"Correlation: {corr:.3f}")
+
+    plt.figure(figsize=(7, 6))
+    sns.scatterplot(x=expected_loss, y=actual_loss, alpha=0.5, color="#4E79A7")
+    max_val = max(expected_loss.max(), actual_loss.max())
+    plt.plot([0, max_val], [0, max_val], "k--", linewidth=1)
+    plt.title("Actual vs Predicted Loss")
+    plt.xlabel("Expected Loss")
+    plt.ylabel("Actual Loss")
+    plt.tight_layout()
+    plt.show()
+
+
+def portfolio_profitability(policy_master: pd.DataFrame) -> None:
+    """
+    Compute portfolio profitability using expected losses and premiums.
+    """
+    df = policy_master.copy()
+
+    # Business logic: profit per policy = premium collected - expected loss.
+    df["profit"] = df["annual_premium"] - df["expected_loss"]
+
+    total_profit = df["profit"].sum()
+    average_profit = df["profit"].mean()
+    total_expected_loss = df["expected_loss"].sum()
+    total_premium = df["annual_premium"].sum()
+    loss_ratio = total_expected_loss / total_premium if total_premium > 0 else np.nan
+
+    print("\n=== Portfolio Profitability ===")
+    print(f"Total profit: {total_profit:,.2f}")
+    print(f"Average profit per policy: {average_profit:,.2f}")
+    print(f"Portfolio loss ratio (expected): {loss_ratio:.3f}")
+
+
+def pricing_strategy(policy_master: pd.DataFrame) -> None:
+    """
+    Analyze profitability by risk segment to inform pricing strategy.
+    """
+    df = policy_master.copy()
+
+    # Business logic: segment-level analysis guides premium adjustments.
+    segment_summary = (
+        df.groupby("risk_segment")
+        .agg(
+            avg_premium=("annual_premium", "mean"),
+            avg_expected_loss=("expected_loss", "mean"),
+            avg_profit=("profit", "mean"),
+        )
+        .reset_index()
+    )
+
+    print("\n=== Pricing Strategy by Risk Segment ===")
+    print(segment_summary.to_string(index=False))
+
+    plt.figure(figsize=(8, 5))
+    sns.barplot(
+        data=segment_summary,
+        x="risk_segment",
+        y="avg_profit",
+        color="#59A14F",
+    )
+    plt.title("Average Profit by Risk Segment")
+    plt.xlabel("Risk Segment")
+    plt.ylabel("Average Profit")
+    plt.tight_layout()
+    plt.show()
+
+    # Pricing actions (business guidance):
+    # - Increase premiums for Very High Risk if avg_profit is negative.
+    # - Offer discounts or retention incentives for Low Risk if margins allow.
+
+
+def _resolve_fraud_signal(df: pd.DataFrame):
+    """
+    Resolve fraud signal column (prediction or proxy) from available fields.
+    """
+    candidates = [
+        "fraud_pred",
+        "fraud_prediction",
+        "fraud_flag_pred",
+        "fraud_score",
+        "fraud_probability",
+    ]
+    for col in candidates:
+        if col in df.columns:
+            return col
+
+    # Fallback: use observed fraud counts to proxy flagged claims when preds are absent.
+    if "fraud_count_per_policy" in df.columns:
+        return "fraud_count_per_policy"
+
+    return ""
+
+
+def fraud_business_impact(policy_master: pd.DataFrame, cost_of_fraud_model: float = 200000.0) -> None:
+    """
+    Estimate financial impact and ROI of the fraud detection model.
+    """
+    df = policy_master.copy()
+    fraud_signal = _resolve_fraud_signal(df)
+
+    if not fraud_signal:
+        print("\n[WARN] No fraud prediction column found. Skipping fraud ROI analysis.")
+        return
+
+    # Business logic: flagged policies are assumed to have prevented claim payouts.
+    if fraud_signal == "fraud_probability":
+        flagged = df[fraud_signal] >= 0.5
+    elif fraud_signal == "fraud_count_per_policy":
+        flagged = df[fraud_signal] > 0
+    else:
+        flagged = df[fraud_signal].astype(int) == 1
+
+    fraud_savings = df.loc[flagged, "total_claim_amount_per_policy"].sum()
+    roi = fraud_savings / cost_of_fraud_model if cost_of_fraud_model > 0 else np.nan
+
+    print("\n=== Fraud Model Business Impact ===")
+    print(f"Fraud savings (avoided losses): {fraud_savings:,.2f}")
+    print(f"Fraud model cost (annual): {cost_of_fraud_model:,.2f}")
+    print(f"ROI: {roi:.2f}")
+
+
+def pricing_scenario(policy_master: pd.DataFrame) -> None:
+    """
+    Simulate a pricing adjustment for high-risk customers and compare outcomes.
+    """
+    df = policy_master.copy()
+
+    base_premium = df["annual_premium"].sum()
+    base_expected_loss = df["expected_loss"].sum()
+    base_profit = (df["annual_premium"] - df["expected_loss"]).sum()
+    base_loss_ratio = base_expected_loss / base_premium if base_premium > 0 else np.nan
+
+    # Business scenario: increase premium by 10% for High Risk and Very High Risk.
+    scenario_premium = df["annual_premium"].copy()
+    high_risk_mask = df["risk_segment"].isin(["High Risk", "Very High Risk"])
+    scenario_premium.loc[high_risk_mask] *= 1.10
+
+    new_premium = scenario_premium.sum()
+    new_profit = (scenario_premium - df["expected_loss"]).sum()
+    new_loss_ratio = base_expected_loss / new_premium if new_premium > 0 else np.nan
+
+    print("\n=== Pricing Scenario: +10% Premium for High Risk ===")
+    print(f"Base premium revenue: {base_premium:,.2f}")
+    print(f"New premium revenue: {new_premium:,.2f}")
+    print(f"Base profit: {base_profit:,.2f}")
+    print(f"New profit: {new_profit:,.2f}")
+    print(f"Base loss ratio: {base_loss_ratio:.3f}")
+    print(f"New loss ratio: {new_loss_ratio:.3f}")
+
+
+def pipeline_main(base_dir: str = "Dataset"):
     customers, policies, claims, external_risk_factors = load_data(base_dir)
     validate_integrity(customers, policies, claims, external_risk_factors)
     policy_master = build_policy_dataset(
@@ -220,5 +409,15 @@ def main(base_dir: str = "Dataset"):
     return policy_master, claim_master
 
 
+def main(policy_master: pd.DataFrame):
+    policy_master = compute_expected_losses(policy_master)
+    loss_comparison(policy_master)
+    portfolio_profitability(policy_master)
+    pricing_strategy(policy_master)
+    fraud_business_impact(policy_master)
+    pricing_scenario(policy_master)
+    return policy_master
+
+
 if __name__ == "__main__":
-    policy_master, claim_master = main()
+    policy_master, claim_master = pipeline_main()

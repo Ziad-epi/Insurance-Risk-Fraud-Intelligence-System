@@ -2,11 +2,24 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import shap
 import warnings
 from scipy import stats
 import statsmodels.api as sm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_poisson_deviance
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    roc_curve,
+)
+from imblearn.over_sampling import SMOTE
 
 SEED = 42
 np.random.seed(SEED)
@@ -1235,13 +1248,638 @@ def interpret_coefficients(model) -> None:
     # Example: exp(coef)=1.20 implies ~20% higher expected claim cost.
 
 
-def main(claim_master: pd.DataFrame):
+def severity_main(claim_master: pd.DataFrame):
     X_train, X_test, y_train, y_test = prepare_severity_data(claim_master)
     model = train_gamma_glm(X_train, y_train)
     evaluate_model(model, X_test, y_test)
     residual_analysis(model, X_test, y_test)
     interpret_coefficients(model)
     return model
+
+
+def _align_to_model_exog(X: pd.DataFrame, model) -> pd.DataFrame:
+    """Align feature matrix to the model's training design matrix."""
+    exog_names = list(model.model.exog_names)
+    X_aligned = X.reindex(columns=exog_names, fill_value=0.0)
+    return X_aligned
+
+
+def _ensure_exposure(policy_master: pd.DataFrame) -> pd.Series:
+    """Resolve exposure column for frequency offset."""
+    df = policy_master.copy()
+    if "exposure_years" in df.columns:
+        return df["exposure_years"].astype(float)
+    exposure_col = _first_existing(
+        df, ["exposure", "policy_exposure", "exposure_years"], "exposure"
+    )
+    return df[exposure_col].astype(float)
+
+
+def predict_frequency(policy_master: pd.DataFrame, frequency_model) -> pd.DataFrame:
+    """Predict expected claim frequency using a trained Poisson GLM."""
+    df = policy_master.copy()
+
+    # Base numeric features (match training design)
+    age_col = _first_existing(df, ["age", "driver_age", "policyholder_age"], "age")
+    vehicle_age_col = _first_existing(
+        df, ["vehicle_age", "car_age", "vehicle_years"], "vehicle_age"
+    )
+    vehicle_power_col = _first_existing(
+        df, ["vehicle_power", "engine_power", "horsepower"], "vehicle_power"
+    )
+    bonus_malus_col = _first_existing(
+        df, ["bonus_malus", "bonus_malus_factor", "bonus_malus_score"], "bonus_malus"
+    )
+    econ_col = _first_existing(
+        df,
+        ["economic_index", "inflation", "inflation_rate", "cpi", "region_risk_index"],
+        "economic_index",
+    )
+
+    num_features = df[
+        [age_col, vehicle_age_col, vehicle_power_col, bonus_malus_col, econ_col]
+    ].copy()
+    num_features["age_bonus_malus_interaction"] = num_features[age_col] * num_features[bonus_malus_col]
+    num_features["power_vehicle_age_interaction"] = num_features[vehicle_power_col] * num_features[vehicle_age_col]
+    num_features["bonus_malus_econ_interaction"] = num_features[bonus_malus_col] * num_features[econ_col]
+
+    # Categorical features
+    region_col = _first_existing(df, ["region", "territory", "geo_region"], "region")
+    vehicle_col = _first_existing(
+        df, ["vehicle_type", "vehicle_class", "vehicle_segment"], "vehicle_type"
+    )
+    cat_dummies = pd.get_dummies(df[[region_col, vehicle_col]], drop_first=True)
+
+    X = pd.concat([num_features, cat_dummies], axis=1)
+    X = sm.add_constant(X, has_constant="add")
+    X = _align_to_model_exog(X, frequency_model)
+
+    # Offset: log exposure (actuarial exposure adjustment)
+    exposure = _ensure_exposure(df)
+    offset = np.log(exposure.replace(0, np.nan))
+    offset = offset.fillna(0.0)
+
+    y_pred = frequency_model.predict(X, offset=offset)
+    df["expected_claim_frequency"] = np.maximum(y_pred, 1e-9)
+    return df
+
+
+def predict_severity(policy_master: pd.DataFrame, severity_model) -> pd.DataFrame:
+    """Predict expected claim severity using a trained Gamma GLM."""
+    df = policy_master.copy()
+
+    # Base numeric features (policy-level proxies)
+    age_col = _first_existing(df, ["age", "driver_age", "policyholder_age"], "age")
+    vehicle_age_col = _first_existing(
+        df, ["vehicle_age", "car_age", "vehicle_years"], "vehicle_age"
+    )
+    vehicle_power_col = _first_existing(
+        df, ["vehicle_power", "engine_power", "horsepower"], "vehicle_power"
+    )
+    bonus_malus_col = _first_existing(
+        df, ["bonus_malus", "bonus_malus_factor", "bonus_malus_score"], "bonus_malus"
+    )
+    inflation_col = _first_existing(
+        df, ["inflation_index", "inflation", "cpi", "inflation_rate"], "inflation_index"
+    )
+    premium_col = _first_existing(
+        df,
+        ["annual_premium", "earned_premium", "premium", "written_premium", "net_premium"],
+        "premium",
+    )
+
+    # Avoid leakage: do not use actual claim amounts for engineered features
+    if "expected_claim_severity" in df.columns:
+        amount_basis = df["expected_claim_severity"].astype(float)
+    else:
+        amount_basis = np.zeros(len(df), dtype=float)
+        warnings.warn(
+            "No prior expected severity provided. claim_to_premium_ratio and "
+            "large_and_fast_flag set to zero to avoid leakage."
+        )
+
+    delay_col = _first_existing(
+        df,
+        ["delay", "report_delay", "claim_report_delay_days", "days_to_report"],
+        "delay",
+        required=False,
+    )
+    if delay_col:
+        delay_val = df[delay_col].astype(float)
+    else:
+        delay_val = pd.Series(np.zeros(len(df)), index=df.index)
+        warnings.warn("No delay column found; using zero delay for severity features.")
+
+    df["claim_to_premium_ratio"] = amount_basis / df[premium_col].replace(0, np.nan)
+    df["suspicious_delay_flag"] = (delay_val > 15).astype(int)
+    df["large_and_fast_flag"] = ((amount_basis > 4000) & (delay_val <= 3)).astype(int)
+    df["claim_to_premium_ratio"] = df["claim_to_premium_ratio"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    num_cols = [
+        age_col,
+        vehicle_age_col,
+        vehicle_power_col,
+        bonus_malus_col,
+        inflation_col,
+        "claim_to_premium_ratio",
+        "suspicious_delay_flag",
+        "large_and_fast_flag",
+    ]
+    if delay_col:
+        num_cols.insert(4, delay_col)
+    X_num = df[num_cols].copy()
+
+    # Categorical features
+    region_col = _first_existing(
+        df, ["region", "territory", "geo_region", "claim_region"], "region"
+    )
+    vehicle_type_col = _first_existing(
+        df, ["vehicle_type", "vehicle_class", "vehicle_segment"], "vehicle_type"
+    )
+    X_cat = pd.get_dummies(df[[region_col, vehicle_type_col]], drop_first=True)
+
+    X = pd.concat([X_num, X_cat], axis=1)
+    X = sm.add_constant(X, has_constant="add")
+    X = _align_to_model_exog(X, severity_model)
+
+    y_pred = severity_model.predict(X)
+    df["expected_claim_severity"] = np.maximum(y_pred, 1e-9)
+    return df
+
+
+def compute_pure_premium(policy_master: pd.DataFrame) -> pd.DataFrame:
+    """Compute pure premium and expected loss ratio."""
+    df = policy_master.copy()
+    premium_col = _first_existing(
+        df, ["annual_premium", "earned_premium", "premium", "written_premium", "net_premium"], "premium"
+    )
+
+    df["pure_premium"] = df["expected_claim_frequency"] * df["expected_claim_severity"]
+    df["expected_loss_ratio"] = df["pure_premium"] / df[premium_col].replace(0, np.nan)
+    return df
+
+
+def risk_segmentation(policy_master: pd.DataFrame) -> pd.DataFrame:
+    """Segment policies into risk tiers using pure premium."""
+    df = policy_master.copy()
+    labels = ["Low Risk", "Medium Risk", "High Risk", "Very High Risk"]
+    df["risk_segment"] = pd.qcut(df["pure_premium"], q=4, labels=labels, duplicates="drop")
+
+    summary = (
+        df.groupby("risk_segment")[["pure_premium", "expected_loss_ratio"]]
+        .mean()
+        .rename(columns={"pure_premium": "avg_pure_premium", "expected_loss_ratio": "avg_loss_ratio"})
+    )
+    print("\n=== Risk Segmentation Summary ===")
+    print(summary.to_string())
+    return df
+
+
+def portfolio_analysis(policy_master: pd.DataFrame) -> None:
+    """Portfolio-level pricing diagnostics."""
+    df = policy_master.copy()
+
+    plt.figure(figsize=(8, 5))
+    sns.histplot(df["pure_premium"].dropna(), bins=30, color="#4E79A7")
+    plt.title("Pure Premium Distribution")
+    plt.xlabel("Pure Premium")
+    plt.ylabel("Policies")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    sns.histplot(df["expected_loss_ratio"].dropna(), bins=30, color="#E15759")
+    plt.title("Expected Loss Ratio Distribution")
+    plt.xlabel("Expected Loss Ratio")
+    plt.ylabel("Policies")
+    plt.tight_layout()
+    plt.show()
+
+    region_col = _first_existing(df, ["region", "territory", "geo_region"], "region")
+    vehicle_col = _first_existing(
+        df, ["vehicle_type", "vehicle_class", "vehicle_segment"], "vehicle_type"
+    )
+
+    region_pp = df.groupby(region_col)["pure_premium"].mean().sort_values()
+    plt.figure(figsize=(9, 5))
+    sns.barplot(x=region_pp.index, y=region_pp.values, color="#76B7B2")
+    plt.title("Average Pure Premium by Region")
+    plt.xlabel("Region")
+    plt.ylabel("Average Pure Premium")
+    plt.xticks(rotation=35, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+    vehicle_pp = df.groupby(vehicle_col)["pure_premium"].mean().sort_values()
+    plt.figure(figsize=(9, 5))
+    sns.barplot(x=vehicle_pp.index, y=vehicle_pp.values, color="#59A14F")
+    plt.title("Average Pure Premium by Vehicle Type")
+    plt.xlabel("Vehicle Type")
+    plt.ylabel("Average Pure Premium")
+    plt.xticks(rotation=35, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+
+def validate_pricing(policy_master: pd.DataFrame) -> None:
+    """Compare predicted pure premium against actual losses."""
+    df = policy_master.copy()
+
+    loss_col = _first_existing(
+        df,
+        [
+            "total_claim_amount_per_policy",
+            "total_claim_amount",
+            "total_claims_amount",
+            "incurred_loss",
+            "loss_amount",
+            "total_loss",
+            "claim_cost",
+        ],
+        "total_claim_amount_per_policy",
+    )
+    actual = df[loss_col].astype(float)
+    predicted = df["pure_premium"].astype(float)
+
+    mae = mean_absolute_error(actual, predicted)
+    rmse = mean_squared_error(actual, predicted, squared=False)
+    corr = actual.corr(predicted)
+
+    print("\n=== Pricing Validation ===")
+    print(f"MAE: {mae:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"Correlation (Actual vs Predicted): {corr:.3f}")
+
+    plt.figure(figsize=(7, 6))
+    plt.scatter(predicted, actual, alpha=0.4, color="#F28E2B")
+    max_val = max(predicted.max(), actual.max())
+    plt.plot([0, max_val], [0, max_val], color="black", linestyle="--", linewidth=1)
+    plt.title("Actual vs Predicted Losses")
+    plt.xlabel("Predicted Pure Premium")
+    plt.ylabel("Actual Loss per Policy")
+    plt.tight_layout()
+    plt.show()
+
+
+def pricing_main(policy_master, frequency_model, severity_model):
+    policy_master = predict_frequency(policy_master, frequency_model)
+    policy_master = predict_severity(policy_master, severity_model)
+    policy_master = compute_pure_premium(policy_master)
+    policy_master = risk_segmentation(policy_master)
+    portfolio_analysis(policy_master)
+    validate_pricing(policy_master)
+    return policy_master
+
+
+def prepare_fraud_dataset(claim_master: pd.DataFrame):
+    """Prepare dataset for fraud modeling with robust feature engineering."""
+    df = claim_master.copy()
+
+    # Target
+    fraud_col = _first_existing(
+        df,
+        ["fraud_flag", "fraud_label", "is_fraud", "fraud_indicator", "fraudulent"],
+        "fraud_flag",
+    )
+
+    # Core predictors (avoid leakage: only observable claim/context variables)
+    amount_col = _first_existing(
+        df,
+        ["claim_amount", "claim_cost", "loss_amount", "paid_amount", "incurred_amount"],
+        "claim_amount",
+    )
+    delay_col = _first_existing(
+        df,
+        ["delay", "report_delay", "claim_report_delay_days", "days_to_report"],
+        "delay",
+    )
+    date_col = _first_existing(
+        df,
+        ["claim_date", "accident_date", "loss_date", "report_date"],
+        "claim_date",
+    )
+    vehicle_age_col = _first_existing(
+        df, ["vehicle_age", "car_age", "vehicle_years"], "vehicle_age"
+    )
+    vehicle_power_col = _first_existing(
+        df, ["vehicle_power", "engine_power", "horsepower"], "vehicle_power"
+    )
+    bonus_malus_col = _first_existing(
+        df, ["bonus_malus", "bonus_malus_factor", "bonus_malus_score"], "bonus_malus"
+    )
+    inflation_col = _first_existing(
+        df, ["inflation_index", "inflation", "cpi", "inflation_rate"], "inflation_index"
+    )
+    premium_col = _first_existing(
+        df,
+        ["annual_premium", "earned_premium", "premium", "written_premium", "net_premium"],
+        "premium",
+    )
+    region_col = _first_existing(
+        df, ["region", "territory", "geo_region", "claim_region"], "region"
+    )
+    vehicle_type_col = _first_existing(
+        df, ["vehicle_type", "vehicle_class", "vehicle_segment"], "vehicle_type"
+    )
+
+    # Parse date and derive calendar features (fraud seasonality patterns)
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df["claim_month"] = df[date_col].dt.month
+    df["claim_weekday"] = df[date_col].dt.weekday
+
+    # Engineered severity/behavioral signals
+    df["log_claim_amount"] = np.log1p(df[amount_col].astype(float))
+    df["claim_to_premium_ratio"] = df[amount_col] / df[premium_col].replace(0, np.nan)
+    df["suspicious_delay_flag"] = (df[delay_col] > 15).astype(int)
+    df["large_and_fast_flag"] = ((df[amount_col] > 4000) & (df[delay_col] <= 3)).astype(int)
+    df["claim_to_premium_ratio"] = df["claim_to_premium_ratio"].replace([np.inf, -np.inf], np.nan)
+
+    # Remove missing critical variables
+    critical_cols = [
+        fraud_col,
+        amount_col,
+        delay_col,
+        date_col,
+        vehicle_age_col,
+        vehicle_power_col,
+        bonus_malus_col,
+        inflation_col,
+        premium_col,
+        region_col,
+        vehicle_type_col,
+        "log_claim_amount",
+        "claim_month",
+        "claim_weekday",
+        "claim_to_premium_ratio",
+    ]
+    df = df.dropna(subset=critical_cols).copy()
+
+    # Target
+    y = df[fraud_col].astype(int)
+
+    # Feature matrix
+    X_num = df[
+        [
+            amount_col,
+            "log_claim_amount",
+            delay_col,
+            "claim_month",
+            "claim_weekday",
+            vehicle_age_col,
+            vehicle_power_col,
+            bonus_malus_col,
+            inflation_col,
+            "claim_to_premium_ratio",
+            "suspicious_delay_flag",
+            "large_and_fast_flag",
+        ]
+    ].copy()
+
+    X_cat = pd.get_dummies(df[[region_col, vehicle_type_col]], drop_first=True)
+    X = pd.concat([X_num, X_cat], axis=1)
+
+    # Train/test split with stratification to preserve fraud rate
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, train_size=0.8, random_state=42, stratify=y
+    )
+
+    return X_train, X_test, y_train, y_test
+
+
+def handle_imbalance(X_train: pd.DataFrame, y_train: pd.Series):
+    """Apply SMOTE on training data to address fraud class imbalance."""
+    print("\nClass distribution before SMOTE:")
+    print(y_train.value_counts().to_string())
+
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_train, y_train)
+
+    X_train_resampled = pd.DataFrame(X_res, columns=X_train.columns)
+    y_train_resampled = pd.Series(y_res, name=y_train.name)
+
+    print("\nClass distribution after SMOTE:")
+    print(y_train_resampled.value_counts().to_string())
+
+    return X_train_resampled, y_train_resampled
+
+
+def train_model(X_train: pd.DataFrame, y_train: pd.Series):
+    """Train baseline and tree-based fraud models."""
+    # Baseline: interpretable logistic regression
+    log_reg = LogisticRegression(max_iter=1000, solver="liblinear", class_weight="balanced")
+    log_reg.fit(X_train, y_train)
+
+    # Tree-based: captures non-linear fraud patterns
+    rf = RandomForestClassifier(
+        n_estimators=300, max_depth=10, class_weight="balanced", random_state=42, n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+
+    return {"logistic_regression": log_reg, "random_forest": rf}
+
+
+def evaluate_models(models: dict, X_test: pd.DataFrame, y_test: pd.Series) -> None:
+    """Evaluate models with emphasis on fraud recall."""
+    for name, model in models.items():
+        y_pred = model.predict(X_test)
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(X_test)[:, 1]
+        elif hasattr(model, "decision_function"):
+            y_score = model.decision_function(X_test)
+        else:
+            y_score = y_pred
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        auc = roc_auc_score(y_test, y_score)
+        cm = confusion_matrix(y_test, y_pred)
+
+        print(f"\n=== {name.upper()} ===")
+        print(f"Accuracy: {acc:.4f}")
+        print(f"Precision: {prec:.4f}")
+        print(f"Recall: {rec:.4f}")  # Fraud detection prioritizes high recall
+        print(f"F1-score: {f1:.4f}")
+        print(f"ROC-AUC: {auc:.4f}")
+        print("Confusion Matrix:")
+        print(cm)
+
+
+def plot_roc_curve(models: dict, X_test: pd.DataFrame, y_test: pd.Series) -> None:
+    """Plot ROC curves for model comparison."""
+    plt.figure(figsize=(7, 6))
+
+    for name, model in models.items():
+        if hasattr(model, "predict_proba"):
+            y_score = model.predict_proba(X_test)[:, 1]
+        elif hasattr(model, "decision_function"):
+            y_score = model.decision_function(X_test)
+        else:
+            y_score = model.predict(X_test)
+
+        fpr, tpr, _ = roc_curve(y_test, y_score)
+        auc = roc_auc_score(y_test, y_score)
+        plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.3f})")
+
+    plt.plot([0, 1], [0, 1], "k--", linewidth=1)
+    plt.title("ROC Curve Comparison")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def feature_importance(model) -> None:
+    """Plot top fraud drivers from Random Forest."""
+    if not hasattr(model, "feature_importances_"):
+        raise ValueError("Model does not support feature importance.")
+
+    if hasattr(model, "feature_names_in_"):
+        feature_names = model.feature_names_in_
+    else:
+        feature_names = [f"feature_{i}" for i in range(len(model.feature_importances_))]
+
+    importances = pd.DataFrame(
+        {"feature": feature_names, "importance": model.feature_importances_}
+    ).sort_values("importance", ascending=False)
+
+    top = importances.head(15)
+
+    plt.figure(figsize=(8, 6))
+    sns.barplot(x="importance", y="feature", data=top, color="#4E79A7")
+    plt.title("Top 15 Fraud Feature Importances")
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.show()
+
+    # Actuarial fraud signals often include large claim amounts, fast reporting,
+    # and high claim-to-premium ratios indicating abnormal claim behavior.
+
+
+def fraud_model_main(claim_master: pd.DataFrame):
+    X_train, X_test, y_train, y_test = prepare_fraud_dataset(claim_master)
+    X_train_resampled, y_train_resampled = handle_imbalance(X_train, y_train)
+    models = train_model(X_train_resampled, y_train_resampled)
+    evaluate_models(models, X_test, y_test)
+    plot_roc_curve(models, X_test, y_test)
+    feature_importance(models["random_forest"])
+    return models
+
+
+def _ensure_feature_frame(X: pd.DataFrame, model) -> pd.DataFrame:
+    """Ensure X is a DataFrame with stable feature names for SHAP plots."""
+    if isinstance(X, pd.DataFrame):
+        return X
+
+    if hasattr(model, "feature_names_in_"):
+        cols = list(model.feature_names_in_)
+    else:
+        cols = [f"feature_{i}" for i in range(X.shape[1])]
+
+    return pd.DataFrame(X, columns=cols)
+
+
+def _select_shap_values(shap_values):
+    """Select SHAP values for the positive class when classification returns a list."""
+    if isinstance(shap_values, list):
+        if len(shap_values) == 1:
+            return shap_values[0]
+        # Binary classification: index 1 corresponds to the positive class.
+        return shap_values[1]
+    return shap_values
+
+
+def initialize_shap(random_forest_model, X_test: pd.DataFrame):
+    """Initialize SHAP TreeExplainer and compute SHAP values on the test set."""
+    X_test = _ensure_feature_frame(X_test, random_forest_model)
+
+    # TreeExplainer is optimized for tree-based models such as Random Forests.
+    explainer = shap.TreeExplainer(random_forest_model)
+    shap_values = explainer.shap_values(X_test)
+    return explainer, shap_values
+
+
+def global_feature_importance(shap_values, X_test: pd.DataFrame) -> None:
+    """Plot global SHAP feature importance and beeswarm summary."""
+    shap_values_pos = _select_shap_values(shap_values)
+
+    # Bar plot: average absolute impact of each feature.
+    shap.summary_plot(shap_values_pos, X_test, plot_type="bar", show=True)
+
+    # Beeswarm plot: distribution and direction of impacts across observations.
+    shap.summary_plot(shap_values_pos, X_test, show=True)
+
+
+def explain_individual_prediction(explainer, shap_values, X_test: pd.DataFrame) -> None:
+    """Explain a single prediction with a SHAP force plot."""
+    shap_values_pos = _select_shap_values(shap_values)
+
+    # Randomly select a claim from the test set for local explanation.
+    rng = np.random.default_rng(SEED)
+    idx = rng.integers(0, len(X_test))
+
+    # Positive SHAP values increase fraud probability; negative values decrease it.
+    # The force plot shows how each feature pushes the prediction higher or lower.
+    expected_value = explainer.expected_value
+    if isinstance(expected_value, (list, np.ndarray)):
+        expected_value = expected_value[1]
+
+    shap.force_plot(
+        expected_value,
+        shap_values_pos[idx],
+        X_test.iloc[idx],
+        matplotlib=True,
+        show=True,
+    )
+
+
+def shap_dependence(shap_values, X_test: pd.DataFrame) -> None:
+    """Create dependence plots for the top 5 most important features."""
+    shap_values_pos = _select_shap_values(shap_values)
+
+    # Rank features by mean absolute SHAP value.
+    mean_abs = np.abs(shap_values_pos).mean(axis=0)
+    ranked_features = list(X_test.columns[np.argsort(mean_abs)[::-1]])
+
+    # Prioritize example features if they exist, then fill to top 5.
+    example_features = [
+        "claim_amount",
+        "delay",
+        "claim_to_premium_ratio",
+        "suspicious_delay_flag",
+        "vehicle_age",
+    ]
+    selected = [f for f in example_features if f in X_test.columns]
+    for f in ranked_features:
+        if f not in selected:
+            selected.append(f)
+        if len(selected) == 5:
+            break
+
+    for feature in selected:
+        shap.dependence_plot(feature, shap_values_pos, X_test, show=True)
+
+
+def business_interpretation() -> None:
+    """Explain key findings in business terms for fraud investigation teams."""
+    print("\n=== Business Interpretation (Fraud Risk Insights) ===")
+    print("- Large claim amounts are associated with higher fraud risk.")
+    print("- Long reporting delays increase the likelihood of fraudulent behavior.")
+    print("- High claim-to-premium ratios often indicate abnormal claims.")
+    print("- Certain vehicle types can show elevated fraud patterns in the data.")
+    print("- Flags like suspicious delays help distinguish legitimate from risky claims.")
+
+
+def main(random_forest_model, X_test: pd.DataFrame):
+    explainer, shap_values = initialize_shap(random_forest_model, X_test)
+    global_feature_importance(shap_values, X_test)
+    explain_individual_prediction(explainer, shap_values, X_test)
+    shap_dependence(shap_values, X_test)
+    business_interpretation()
+    return explainer
 
 
 def generate_data_main():
