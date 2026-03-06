@@ -1,0 +1,16 @@
+paths:
+  raw_data: data/raw
+  processed_data: data/processed
+  models: models/saved_models
+
+model_params:
+  frequency_model:
+    type: poisson_glm
+
+  severity_model:
+    type: gamma_glm
+
+  fraud_model:
+    type: random_forest
+    n_estimators: 300
+    max_depth: 10
