@@ -20,8 +20,70 @@ def load_data() -> pd.DataFrame:
     """
     Load the policy-level master dataset from CSV.
     """
-    data_path = Path(__file__).resolve().parent / "policy_master.csv"
-    return pd.read_csv(data_path)
+    base_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        base_dir / "insurance-risk-analytics" / "data" / "processed" / "modeling_dataset.csv",
+        base_dir / "insurance-risk-analytics" / "data" / "raw" / "policies.csv",
+        base_dir / "insurance-risk-analytics" / "data" / "raw" / "policy_master.csv",
+        base_dir / "policies.csv",
+        base_dir / "policy_master.csv",
+    ]
+    data_path = next((p for p in candidate_paths if p.exists()), None)
+    if data_path is None:
+        expected = "\n".join(str(p) for p in candidate_paths)
+        raise FileNotFoundError(f"Could not find dataset. Tried:\n{expected}")
+
+    df = pd.read_csv(data_path)
+    return _add_display_columns(df)
+
+
+def _add_display_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure dashboard-friendly columns exist, even when data is one-hot encoded.
+    """
+    df = df.copy()
+
+    if "annual_premium" not in df.columns and "premium" in df.columns:
+        df["annual_premium"] = df["premium"]
+
+    if "expected_loss_ratio" not in df.columns:
+        if "expected_claim_frequency" in df.columns and "expected_claim_severity" in df.columns:
+            expected_loss = df["expected_claim_frequency"] * df["expected_claim_severity"]
+            denom = df["annual_premium"] if "annual_premium" in df.columns else 1.0
+            df["expected_loss_ratio"] = expected_loss / denom.replace(0, np.nan)
+
+    if "fraud_flag" not in df.columns and "fraud_label" in df.columns:
+        df["fraud_flag"] = df["fraud_label"]
+
+    if "vehicle_type" not in df.columns:
+        vehicle_cols = [c for c in df.columns if c.startswith("vehicle_type_")]
+        if vehicle_cols:
+            vehicle_values = df[vehicle_cols]
+            max_col = vehicle_values.idxmax(axis=1)
+            df["vehicle_type"] = max_col.str.replace("vehicle_type_", "", regex=False)
+            df.loc[vehicle_values.max(axis=1) == 0, "vehicle_type"] = "unknown"
+        else:
+            df["vehicle_type"] = "unknown"
+
+    if "region" not in df.columns:
+        df["region"] = "all"
+
+    if "risk_segment" not in df.columns:
+        segment_source = None
+        for col in ["expected_loss_ratio", "pure_premium", "claim_to_premium_ratio"]:
+            if col in df.columns and df[col].nunique(dropna=True) >= 3:
+                segment_source = col
+                break
+        if segment_source:
+            df["risk_segment"] = pd.qcut(
+                df[segment_source].rank(method="first"),
+                q=3,
+                labels=["Low", "Medium", "High"],
+            )
+        else:
+            df["risk_segment"] = "Medium"
+
+    return df
 
 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
