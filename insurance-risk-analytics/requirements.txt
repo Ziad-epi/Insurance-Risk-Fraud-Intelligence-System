@@ -1,6 +1,7 @@
 ﻿pandas
 numpy
 scikit-learn
+imbalanced-learn
 statsmodels
 matplotlib
 seaborn

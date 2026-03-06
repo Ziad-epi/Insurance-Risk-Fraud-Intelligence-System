@@ -11,11 +11,11 @@ def _load_csv(path):
     return pd.read_csv(path)
 
 
-def load_policy_data(raw_dir="data/raw", filename="policy_master.csv"):
+def load_policy_data(raw_dir="data/raw", filename="policies.csv"):
     """Load policy master data."""
     return _load_csv(Path(raw_dir) / filename)
 
 
-def load_claim_data(raw_dir="data/raw", filename="claim_master.csv"):
+def load_claim_data(raw_dir="data/raw", filename="claims.csv"):
     """Load claim master data."""
     return _load_csv(Path(raw_dir) / filename)
